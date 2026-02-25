@@ -8,10 +8,11 @@ Right-click any file or folder to open, download, or copy its path.
 
 ## Features
 
-- **SSH browsing** — mount remote filesystems via `sshfs` and browse them natively in yazi
+- **SSH into server, browse natively** — yazi runs on the remote machine for instant disk I/O (no network lag per `ls`)
 - **Right-click context menu** — the first context menu plugin for any terminal file manager
-- **Download** — copy remote files/folders to your local `~/Downloads` (or any configured directory)
+- **Download via scp** — copy remote files/folders to your local `~/Downloads`
 - **Copy paths** — absolute, relative, or filename to clipboard
+- **Auto-provisioning** — wrapper deploys the plugin, keymap, and init.lua to the server automatically
 - **Works locally too** — the context menu works on local files without SSH
 
 ## Context menu
@@ -24,34 +25,44 @@ Right-click a file or folder (or press `m`) to open the menu:
 |-----|--------|-------------|
 | `o` | Open | Open with default program |
 | `O` | Open with... | Choose which program to open with |
-| `c` | Copy path | Absolute path (or remote path in SSH mode) |
+| `c` | Copy path | Absolute path (or `user@host:path` in SSH mode) |
 | `r` | Copy relative path | Relative to current directory |
 | `n` | Copy filename | Just the filename |
-| `d` | Download | Copy to `~/Downloads` |
+| `d` | Download | Queue for scp download (SSH) or copy locally |
 
-In SSH mode, "Copy path" returns the real remote path (e.g., `user@host:~/Code/file.py`), not the local mount path.
+In SSH mode, "Copy path" returns the real remote path (e.g., `user@host:~/Code/file.py`).
 
 ## Requirements
 
-- [yazi](https://yazi-rs.github.io/docs/installation/) >= 25.2
-- [sshfs](https://github.com/libfuse/sshfs) (only needed for remote browsing)
+- [yazi](https://yazi-rs.github.io/docs/installation/) >= 25.2 on **both local and server**
+- `ssh` and `scp` (pre-installed on macOS and Linux)
 
-### Installing sshfs
+No sshfs, no macFUSE, no kernel extensions.
 
-**macOS:**
-```bash
-brew install macfuse sshfs
+## How it works
+
+```
+Mac (local)                         Server (remote)
+ |                                    |
+ |--- ssh ControlMaster (bg) ------->| persistent auth socket
+ |--- ssh (foreground, -t) --------->| yazi runs HERE (fast)
+ |                                    |   plugin appends to queue file
+ |--- ssh (background) ------------->| tail -n 0 -f queue
+ |<-- scp (per download) ------------|   piped to process_downloads()
+ |    saves to ~/Downloads            |
 ```
 
-**Ubuntu/Debian:**
-```bash
-sudo apt install sshfs
-```
+All SSH connections share one ControlMaster socket — single authentication, zero overhead. The wrapper:
 
-**Arch Linux:**
-```bash
-sudo pacman -S sshfs
-```
+1. Establishes a ControlMaster connection
+2. Checks that yazi is installed on the server
+3. Auto-provisions the plugin, keymap binding, and right-click handler
+4. Creates a queue file on the server for download requests
+5. Starts a background watcher that tails the queue and runs `scp` for each path
+6. Launches yazi on the server with a TTY (foreground)
+7. Cleans up on exit — kills watcher, removes queue file, closes ControlMaster
+
+Downloads happen asynchronously: press `d` in the menu, and scp transfers run in the background while you keep browsing.
 
 ## Installation
 
@@ -144,41 +155,23 @@ Or pass `-d` to the wrapper:
 yazi-ssh -d ~/Desktop user@host:~/Code
 ```
 
-### sshfs options
+### SSH options
 
-Pass extra sshfs/SSH options with `-o`:
+Pass extra SSH options with `-o`:
 
 ```bash
 yazi-ssh -o "Compression=yes" -o "Ciphers=aes128-ctr" user@host:~/Code
 ```
 
-## How it works
-
-### SSH browsing
-
-`yazi-ssh` is a thin wrapper that:
-
-1. Mounts the remote filesystem locally via `sshfs` (FUSE)
-2. Sets environment variables so the plugin knows we're in SSH mode
-3. Launches yazi pointed at the mount
-4. Unmounts and cleans up on exit
-
-Since the remote filesystem is mounted locally, all yazi features work natively — image previews, file search, bulk operations, etc. "Download" is just a local `cp` from the mount to your downloads folder.
-
-### Context menu
-
-The plugin uses `ya.which()` to show a key-based selection menu. Right-click is intercepted by overriding `Entity:click()` in `init.lua` to dispatch to the plugin instead of the default "open" action.
-
-### Environment variables
+## Environment variables
 
 These are set automatically by the `yazi-ssh` wrapper. The plugin reads them to detect SSH mode:
 
-| Variable | Description |
-|----------|-------------|
-| `YAZI_SSH_REMOTE` | Remote host (e.g., `user@host`) |
-| `YAZI_SSH_REMOTE_PATH` | Remote base path (e.g., `~/Code`) |
-| `YAZI_SSH_MOUNT` | Local mount point |
-| `YAZI_SSH_DOWNLOAD_DIR` | Download destination |
+| Variable | Set by | Read by | Description |
+|----------|--------|---------|-------------|
+| `YAZI_SSH_REMOTE` | wrapper | plugin | `user@host` string |
+| `YAZI_SSH_QUEUE` | wrapper | plugin | Queue file path on server |
+| `YAZI_SSH_DOWNLOAD_DIR` | user/wrapper | wrapper | Local download directory |
 
 ## License
 

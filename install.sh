@@ -72,20 +72,16 @@ EOF
 fi
 
 # ------------------------------------------------------------------
-# 4. Check sshfs
+# 4. Server requirements note
 # ------------------------------------------------------------------
-echo "[4/4] Checking sshfs..."
-if command -v sshfs &>/dev/null; then
-    echo "  sshfs: $(sshfs -V 2>&1 | head -1)"
-else
-    echo ""
-    echo "  sshfs not found. Install it for remote browsing:"
-    echo "    macOS:  brew install macfuse sshfs"
-    echo "    Ubuntu: sudo apt install sshfs"
-    echo "    Arch:   sudo pacman -S sshfs"
-    echo ""
-    echo "  The context menu plugin works without sshfs (local files only)."
-fi
+echo "[4/4] Checking setup..."
+echo "  yazi is needed on the server for remote browsing."
+echo "  The wrapper auto-provisions the plugin when you connect."
+echo ""
+echo "  Install yazi on your server:"
+echo "    Ubuntu: cargo install --locked yazi-fm yazi-cli"
+echo "    Arch:   sudo pacman -S yazi"
+echo "    https://yazi-rs.github.io/docs/installation/"
 
 # ------------------------------------------------------------------
 # Done

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# yazi-ssh — browse remote filesystems in yazi via sshfs
+# yazi-ssh — browse remote filesystems in yazi over SSH
+# Runs yazi on the server (instant disk I/O), downloads via scp.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="yazi-ssh"
 
 # -----------------------------------------------------------------
@@ -17,12 +18,13 @@ usage() {
     cat <<EOF
 Usage: $PROGRAM [options] [user@]host[:path]
 
-Browse remote filesystems in yazi via sshfs.
+Browse remote filesystems in yazi over SSH.
+Runs yazi on the server (fast disk I/O), downloads via scp.
 
 Options:
     -i <key>        SSH identity file
     -p <port>       SSH port (default: 22)
-    -o <option>     Extra sshfs/SSH option (repeatable)
+    -o <option>     Extra SSH option (repeatable)
     -d <dir>        Local download directory (default: ~/Downloads)
     -h, --help      Show this help
     -v, --version   Show version
@@ -38,22 +40,27 @@ EOF
 # -----------------------------------------------------------------
 # Parse arguments
 # -----------------------------------------------------------------
-SSH_OPTS=()
-SSHFS_OPTS=()
+SSH_BASE_OPTS=()
+SCP_BASE_OPTS=()
 TARGET=""
+PORT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -i)
-            SSH_OPTS+=(-o "IdentityFile=$2")
+            SSH_BASE_OPTS+=(-i "$2")
+            SCP_BASE_OPTS+=(-i "$2")
             shift 2
             ;;
         -p)
-            SSHFS_OPTS+=(-p "$2")
+            PORT="$2"
+            SSH_BASE_OPTS+=(-p "$2")
+            SCP_BASE_OPTS+=(-P "$2")
             shift 2
             ;;
         -o)
-            SSHFS_OPTS+=(-o "$2")
+            SSH_BASE_OPTS+=(-o "$2")
+            SCP_BASE_OPTS+=(-o "$2")
             shift 2
             ;;
         -d)
@@ -87,19 +94,14 @@ if [[ -z "$TARGET" ]]; then
 fi
 
 # -----------------------------------------------------------------
-# Check dependencies
+# Check local dependencies
 # -----------------------------------------------------------------
 missing=()
-command -v sshfs &>/dev/null || missing+=(sshfs)
-command -v yazi  &>/dev/null || missing+=(yazi)
+command -v ssh &>/dev/null || missing+=(ssh)
+command -v scp &>/dev/null || missing+=(scp)
 
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Error: missing required commands: ${missing[*]}" >&2
-    echo "" >&2
-    echo "Install them first:" >&2
-    echo "  macOS:  brew install macfuse sshfs yazi" >&2
-    echo "  Ubuntu: sudo apt install sshfs && cargo install --locked yazi-fm yazi-cli" >&2
-    echo "  Arch:   sudo pacman -S sshfs yazi" >&2
     exit 1
 fi
 
@@ -108,52 +110,189 @@ fi
 # -----------------------------------------------------------------
 REMOTE_HOST="${TARGET%%:*}"
 if [[ "$TARGET" == *:* ]]; then
-    REMOTE_PATH="${TARGET#*:}"
+    START_DIR="${TARGET#*:}"
 else
-    REMOTE_PATH=""
+    START_DIR="~"
 fi
 
 # -----------------------------------------------------------------
-# Mount
+# ControlMaster socket and temp files
 # -----------------------------------------------------------------
-MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/yazi-ssh-XXXXXX")"
+CTL_SOCK="/tmp/yazi-ssh-ctl-$$"
+WATCHER_LOG="/tmp/yazi-ssh-downloads-$$.log"
+QUEUE_FILE=""
+WATCHER_PID=""
 
+# Add ControlMaster settings to SSH opts
+SSH_BASE_OPTS+=(-o "ControlPath=$CTL_SOCK")
+SCP_BASE_OPTS+=(-o "ControlPath=$CTL_SOCK")
+
+# -----------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------
 cleanup() {
-    echo "Unmounting ${MOUNT_DIR}..."
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        umount "$MOUNT_DIR" 2>/dev/null \
-            || diskutil unmount force "$MOUNT_DIR" 2>/dev/null \
-            || true
-    else
-        fusermount -uz "$MOUNT_DIR" 2>/dev/null \
-            || umount -l "$MOUNT_DIR" 2>/dev/null \
-            || true
+    # Kill local watcher process
+    if [[ -n "$WATCHER_PID" ]]; then
+        kill "$WATCHER_PID" 2>/dev/null || true
+        wait "$WATCHER_PID" 2>/dev/null || true
     fi
-    rmdir "$MOUNT_DIR" 2>/dev/null || true
+
+    # Remove remote queue file
+    if [[ -n "$QUEUE_FILE" ]]; then
+        ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+            "rm -f '$QUEUE_FILE'" 2>/dev/null || true
+    fi
+
+    # Close ControlMaster
+    ssh -O exit -o "ControlPath=$CTL_SOCK" "$REMOTE_HOST" 2>/dev/null || true
+
+    # Print download log if non-empty
+    if [[ -s "$WATCHER_LOG" ]]; then
+        echo ""
+        echo "Downloads:"
+        cat "$WATCHER_LOG"
+    fi
+    rm -f "$WATCHER_LOG"
 }
 trap cleanup EXIT INT TERM
 
-SSHFS_SOURCE="${REMOTE_HOST}:${REMOTE_PATH}"
-echo "Mounting ${SSHFS_SOURCE} → ${MOUNT_DIR}"
+# -----------------------------------------------------------------
+# Download watcher — reads paths from stdin, scp each to local
+# -----------------------------------------------------------------
+process_downloads() {
+    while IFS= read -r remote_path; do
+        [[ -z "$remote_path" ]] && continue
+        local name
+        name="$(basename "$remote_path")"
+        echo "[$(date +%H:%M:%S)] Downloading: $name"
+        if scp "${SCP_BASE_OPTS[@]}" -o ControlMaster=no -r \
+            "${REMOTE_HOST}:${remote_path}" "${DOWNLOAD_DIR}/"; then
+            echo "[$(date +%H:%M:%S)] OK: ${DOWNLOAD_DIR}/$name"
+        else
+            echo "[$(date +%H:%M:%S)] FAILED: $remote_path"
+        fi
+    done
+}
 
-sshfs "$SSHFS_SOURCE" "$MOUNT_DIR" \
-    "${SSH_OPTS[@]+"${SSH_OPTS[@]}"}" \
-    "${SSHFS_OPTS[@]+"${SSHFS_OPTS[@]}"}" \
-    -o reconnect \
+# -----------------------------------------------------------------
+# Establish ControlMaster
+# -----------------------------------------------------------------
+echo "Connecting to ${REMOTE_HOST}..."
+
+if ! ssh "${SSH_BASE_OPTS[@]}" \
+    -o ControlMaster=yes \
     -o ServerAliveInterval=15 \
     -o ServerAliveCountMax=3 \
-    -o follow_symlinks
+    -fN "$REMOTE_HOST"; then
+    echo "Error: could not connect to ${REMOTE_HOST}" >&2
+    exit 1
+fi
 
-echo "Connected. Opening yazi..."
+echo "Connected."
 
 # -----------------------------------------------------------------
-# Launch yazi with SSH metadata for the plugin
+# Pre-flight checks on server
 # -----------------------------------------------------------------
-export YAZI_SSH_REMOTE="$REMOTE_HOST"
-export YAZI_SSH_REMOTE_PATH="$REMOTE_PATH"
-export YAZI_SSH_MOUNT="$MOUNT_DIR"
-export YAZI_SSH_DOWNLOAD_DIR="$DOWNLOAD_DIR"
+if ! ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+    "command -v yazi" &>/dev/null; then
+    echo "Error: yazi is not installed on ${REMOTE_HOST}" >&2
+    echo "" >&2
+    echo "Install it first:" >&2
+    echo "  Ubuntu: cargo install --locked yazi-fm yazi-cli" >&2
+    echo "  Arch:   sudo pacman -S yazi" >&2
+    echo "  https://yazi-rs.github.io/docs/installation/" >&2
+    exit 1
+fi
 
-yazi "$MOUNT_DIR"
+REMOTE_YAZI_VERSION="$(ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+    "yazi --version 2>/dev/null" || echo "unknown")"
+echo "Remote yazi: ${REMOTE_YAZI_VERSION}"
 
+# -----------------------------------------------------------------
+# Auto-provision plugin on server
+# -----------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PLUGIN_SRC="${SCRIPT_DIR}/main.lua"
+REMOTE_PLUGIN_DIR="~/.config/yazi/plugins/yazi-ssh.yazi"
+
+if [[ -f "$PLUGIN_SRC" ]]; then
+    echo "Provisioning plugin on server..."
+    ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+        "mkdir -p ${REMOTE_PLUGIN_DIR}"
+    scp "${SCP_BASE_OPTS[@]}" -o ControlMaster=no \
+        "$PLUGIN_SRC" "${REMOTE_HOST}:${REMOTE_PLUGIN_DIR}/main.lua"
+fi
+
+# -----------------------------------------------------------------
+# Auto-provision keymap on server
+# -----------------------------------------------------------------
+REMOTE_KEYMAP="~/.config/yazi/keymap.toml"
+
+if ! ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+    "grep -q 'yazi-ssh' ${REMOTE_KEYMAP} 2>/dev/null"; then
+    echo "Adding keymap binding (m) on server..."
+    ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+        "mkdir -p ~/.config/yazi && cat >> ${REMOTE_KEYMAP}" <<'EOF'
+
+[[mgr.prepend_keymap]]
+on   = "m"
+run  = "plugin yazi-ssh"
+desc = "Context menu"
+EOF
+fi
+
+# -----------------------------------------------------------------
+# Auto-provision init.lua on server
+# -----------------------------------------------------------------
+REMOTE_INIT="~/.config/yazi/init.lua"
+
+if ! ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+    "grep -q 'yazi-ssh' ${REMOTE_INIT} 2>/dev/null"; then
+    echo "Adding right-click handler on server..."
+    ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+        "mkdir -p ~/.config/yazi && cat >> ${REMOTE_INIT}" <<'EOF'
+
+-- Right-click context menu (yazi-ssh)
+local original_entity_click = Entity.click
+function Entity:click(event, up)
+	if up or event.is_middle then
+		return
+	end
+	ya.emit("reveal", { self._file.url })
+	if event.is_right then
+		ya.emit("plugin", { "yazi-ssh" })
+	else
+		original_entity_click(self, event, up)
+	end
+end
+EOF
+fi
+
+# -----------------------------------------------------------------
+# Create queue file on server
+# -----------------------------------------------------------------
+QUEUE_FILE="$(ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+    "mktemp /tmp/yazi-ssh-queue-XXXXXX")"
+echo "Queue: ${QUEUE_FILE}"
+
+# -----------------------------------------------------------------
+# Start download watcher
+# -----------------------------------------------------------------
+mkdir -p "$DOWNLOAD_DIR"
+
+ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no "$REMOTE_HOST" \
+    "tail -n 0 -f '$QUEUE_FILE'" \
+    | process_downloads >> "$WATCHER_LOG" 2>&1 &
+WATCHER_PID=$!
+
+# -----------------------------------------------------------------
+# Launch yazi on the server (foreground, TTY attached)
+# -----------------------------------------------------------------
+echo "Opening yazi on ${REMOTE_HOST}:${START_DIR}..."
+echo ""
+
+ssh "${SSH_BASE_OPTS[@]}" -o ControlMaster=no -t "$REMOTE_HOST" \
+    "env YAZI_SSH_REMOTE='$REMOTE_HOST' YAZI_SSH_QUEUE='$QUEUE_FILE' yazi '$START_DIR'"
+
+echo ""
 echo "Disconnected."

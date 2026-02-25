@@ -37,34 +37,20 @@ end)
 -- PATH HELPERS
 -- ------------------------------------------------------------------
 
---- Resolve a local sshfs mount path to the real remote path.
---- Returns the original path unchanged when not in SSH mode.
-local function resolve_remote_path(local_path)
-	local mount = os.getenv("YAZI_SSH_MOUNT")
-	local remote = os.getenv("YAZI_SSH_REMOTE")
-	local remote_base = os.getenv("YAZI_SSH_REMOTE_PATH") or ""
+--- Check if running inside an SSH session started by yazi-ssh wrapper.
+local function is_ssh_mode()
+	return os.getenv("YAZI_SSH_QUEUE") ~= nil
+end
 
-	if not mount or not remote then
+--- Resolve a local path to user@host:path format in SSH mode.
+--- Paths are already real server paths (yazi runs on the server),
+--- so we just prepend the remote host prefix.
+local function resolve_remote_path(local_path)
+	local remote = os.getenv("YAZI_SSH_REMOTE")
+	if not remote then
 		return local_path
 	end
-
-	-- Strip the mount prefix to get the relative portion
-	local relative = ""
-	if #local_path > #mount then
-		relative = local_path:sub(#mount + 2) -- +2 skips the trailing /
-	end
-
-	if remote_base ~= "" then
-		if relative ~= "" then
-			return remote .. ":" .. remote_base .. "/" .. relative
-		end
-		return remote .. ":" .. remote_base
-	end
-
-	if relative ~= "" then
-		return remote .. ":~/" .. relative
-	end
-	return remote .. ":"
+	return remote .. ":" .. local_path
 end
 
 --- Return *path* relative to *cwd* (pure string prefix strip).
@@ -79,21 +65,35 @@ local function get_relative_path(url, cwd)
 	return url
 end
 
-local function is_ssh_mode()
-	return os.getenv("YAZI_SSH_MOUNT") ~= nil
-end
+-- ------------------------------------------------------------------
+-- SHELL HELPERS
+-- ------------------------------------------------------------------
 
-local function get_download_dir()
-	return os.getenv("YAZI_SSH_DOWNLOAD_DIR")
-		or os.getenv("HOME") .. "/Downloads"
+local function shell_escape(s)
+	return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
 -- ------------------------------------------------------------------
 -- DOWNLOAD
 -- ------------------------------------------------------------------
 
---- Copy *sources* (list of absolute paths) into *dl_dir*.
---- Returns success_count, fail_count.
+--- Queue remote paths for download by appending to the queue file.
+--- The wrapper's watcher process picks them up and runs scp.
+local function queue_for_download(sources, queue_path)
+	local ok, fail = 0, 0
+	for _, src in ipairs(sources) do
+		local cmd = "printf '%s\\n' " .. shell_escape(src) .. " >> " .. shell_escape(queue_path)
+		local output = Command("sh"):args({ "-c", cmd }):stderr(Command.PIPED):output()
+		if output and output.status and output.status.code == 0 then
+			ok = ok + 1
+		else
+			fail = fail + 1
+		end
+	end
+	return ok, fail
+end
+
+--- Copy *sources* (list of absolute paths) into *dl_dir* (local mode).
 local function download_items(sources, dl_dir)
 	-- Ensure destination exists
 	Command("mkdir"):args({ "-p", dl_dir }):output()
@@ -132,7 +132,7 @@ return {
 		end
 
 		local ssh = is_ssh_mode()
-		local dl_dir = get_download_dir()
+		local queue_path = os.getenv("YAZI_SSH_QUEUE")
 
 		local cands = {
 			{ on = "o", desc = "Open" },
@@ -208,14 +208,26 @@ return {
 		-- Download
 		-- --------------------------------------------------------
 		elseif action == "d" then
-			local ok, fail = download_items(state.selected, dl_dir)
+			local ok, fail, msg
 
-			local msg
-			if fail == 0 then
-				msg = ok .. " item(s) downloaded to " .. dl_dir
+			if ssh and queue_path then
+				ok, fail = queue_for_download(state.selected, queue_path)
+				if fail == 0 then
+					msg = ok .. " item(s) queued for download"
+				else
+					msg = ok .. " queued, " .. fail .. " failed to queue"
+				end
 			else
-				msg = ok .. " downloaded, " .. fail .. " failed"
+				local dl_dir = os.getenv("YAZI_SSH_DOWNLOAD_DIR")
+					or os.getenv("HOME") .. "/Downloads"
+				ok, fail = download_items(state.selected, dl_dir)
+				if fail == 0 then
+					msg = ok .. " item(s) downloaded to " .. dl_dir
+				else
+					msg = ok .. " downloaded, " .. fail .. " failed"
+				end
 			end
+
 			ya.notify({
 				title = "Download",
 				content = msg,
