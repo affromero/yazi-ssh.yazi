@@ -140,7 +140,7 @@ return {
 			{ on = "c", desc = ssh and "Copy remote path" or "Copy absolute path" },
 			{ on = "r", desc = "Copy relative path" },
 			{ on = "n", desc = "Copy filename" },
-			{ on = "d", desc = "Download to " .. dl_dir },
+			{ on = "d", desc = "Download" },
 		}
 
 		local idx = ya.which({ cands = cands })
