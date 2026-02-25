@@ -54,7 +54,7 @@ sudo pacman -S sshfs
 ### Full install (SSH + context menu)
 
 ```bash
-git clone https://github.com/afromero/yazi-ssh.git /tmp/yazi-ssh
+git clone https://github.com/affromero/yazi-ssh.git /tmp/yazi-ssh
 bash /tmp/yazi-ssh/install.sh
 ```
 
@@ -68,7 +68,7 @@ This installs:
 If you just want the right-click context menu for local files:
 
 ```bash
-ya pkg add afromero/yazi-ssh
+ya pkg add affromero/yazi-ssh
 ```
 
 Then add the right-click handler to `~/.config/yazi/init.lua`:

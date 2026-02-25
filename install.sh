@@ -2,7 +2,7 @@
 # install.sh — install yazi-ssh (plugin + wrapper + right-click handler)
 set -euo pipefail
 
-REPO="afromero/yazi-ssh"
+REPO="affromero/yazi-ssh"
 BIN_DIR="${HOME}/.local/bin"
 INIT_LUA="${HOME}/.config/yazi/init.lua"
 
