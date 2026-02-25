@@ -70,6 +70,16 @@ All SSH connections share one ControlMaster socket — single authentication, ze
 
 Downloads happen asynchronously: press `d` in the menu, and scp transfers run in the background while you keep browsing.
 
+### Why a wrapper + plugin (not just a plugin)?
+
+The SSH session can't live inside a yazi plugin because:
+
+- **TTY allocation** — the wrapper needs `ssh -t` to give yazi a terminal on the server. Lua's `Command()` API can't allocate a TTY.
+- **Lifecycle** — the ControlMaster socket must be established *before* yazi starts and torn down *after* it exits. A plugin runs *inside* yazi, so it can't manage the process that spawns yazi itself.
+- **Background watcher** — the `tail -f queue | scp` pipeline runs as a local background process alongside the SSH session. Yazi plugins can't fork persistent background processes.
+
+The wrapper runs on the **client** (sets up the tunnel), the plugin runs on the **server** (queues downloads, copies paths). They're on different machines doing different jobs.
+
 ## Installation
 
 ### Full install (SSH + context menu)
